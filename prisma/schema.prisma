@@ -1,0 +1,293 @@
+// Prisma mirror of db/schema.sql (SQL file is the source of truth for DDL details
+// such as the generated sla_hours column and CHECK constraints).
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PartnerCategory {
+  E_HAILING
+  DELIVERY
+  LOGISTICS
+}
+enum FeedFormat {
+  WEEKLY_ARRAY
+  MONTHLY_TOTALS
+  TRIP_LEDGER
+}
+enum CreditTier {
+  A
+  B
+  C
+}
+enum ApplicationStatus {
+  RECEIVED
+  DATA_INGESTED
+  IDENTITY_VERIFIED
+  BUREAU_CHECKED
+  UNDERWRITTEN
+  OFFER_ISSUED
+  SIGNED
+  DISBURSED
+  DECLINED
+  REFERRED
+  EXPIRED
+  FAILED
+}
+enum InstallmentStatus {
+  SCHEDULED
+  PAID
+  PARTIAL
+  OVERDUE
+  GUARANTEED
+  WRITTEN_OFF
+}
+enum PolicyStatus {
+  PENDING
+  ACTIVE
+  EXHAUSTED
+  EXPIRED
+  CANCELLED
+}
+enum FloodAlertLevel {
+  NONE
+  ADVISORY
+  WARNING
+  DANGER
+}
+enum TriggerOutcome {
+  TRIGGERED
+  NOT_TRIGGERED
+  REVIEW
+}
+enum PayoutStatus {
+  PENDING
+  SETTLED
+  REVERSED
+}
+
+model PartnerPlatform {
+  id               String          @id
+  name             String
+  category         PartnerCategory
+  feedFormat       FeedFormat
+  webhookSecretRef String
+  apiStatus        String          @default("HEALTHY")
+  lastHeartbeatAt  DateTime?
+  p95LatencyMs     Int?
+  onboardedAt      DateTime        @default(now())
+  borrowers        Borrower[]
+  applications     LoanApplication[]
+
+  @@map("partner_platforms")
+}
+
+model Borrower {
+  id                   String     @id @default(uuid()) @db.Uuid
+  partnerId            String
+  externalWorkerId     String
+  fullName             String
+  nricHash             String
+  phoneE164            String?
+  homeRegion           String
+  platformTenureMonths Int
+  facilityStage        Int        @default(1)
+  creditTier           CreditTier?
+  altScore             Decimal?   @db.Decimal(5, 2)
+  createdAt            DateTime   @default(now())
+  partner              PartnerPlatform @relation(fields: [partnerId], references: [id])
+  applications         LoanApplication[]
+  policies             ParametricPolicy[]
+  pings                LocationPing[]
+
+  @@unique([partnerId, externalWorkerId])
+  @@map("borrowers")
+}
+
+model LoanApplication {
+  id                    String            @id @default(uuid()) @db.Uuid
+  idempotencyKey        String
+  borrowerId            String            @db.Uuid
+  partnerId             String
+  status                ApplicationStatus @default(RECEIVED)
+  requestedTenureMonths Int
+  requestedAmount       Decimal?          @db.Decimal(14, 2)
+  facilityStage         Int               @default(1)
+  trailing26wPayouts    Decimal[]         @db.Decimal(14, 2)
+  trailingAvgWeekly     Decimal           @db.Decimal(14, 2)
+  altScore              Decimal?          @db.Decimal(5, 2)
+  creditTier            CreditTier?
+  decisionReasons       String[]
+  approvedPrincipal     Decimal?          @db.Decimal(14, 2)
+  aprPct                Decimal?          @db.Decimal(5, 2)
+  weeklyInstallment     Decimal?          @db.Decimal(14, 2)
+  deductionRatePct      Decimal?          @db.Decimal(4, 2)
+  weeklyCapPct          Decimal?          @db.Decimal(4, 2)
+  receivedAt            DateTime          @default(now())
+  disbursedAt           DateTime?
+  pipelineTrace         Json              @default("[]")
+  npsScore              Int?
+  borrower              Borrower          @relation(fields: [borrowerId], references: [id])
+  partner               PartnerPlatform   @relation(fields: [partnerId], references: [id])
+  schedule              RepaymentSchedule[]
+  policy                ParametricPolicy?
+  featureSnapshots      PdFeatureSnapshot[]
+  labels                PdLabel[]
+
+  // sla_hours is a generated column in SQL; query it with $queryRaw.
+  @@unique([partnerId, idempotencyKey])
+  @@index([status, receivedAt(sort: Desc)])
+  @@map("loan_applications")
+}
+
+model RepaymentSchedule {
+  id                String            @id @default(uuid()) @db.Uuid
+  applicationId     String            @db.Uuid
+  installmentNo     Int
+  dueDate           DateTime          @db.Date
+  principalDue      Decimal           @db.Decimal(14, 2)
+  interestDue       Decimal           @db.Decimal(14, 2)
+  installmentDue    Decimal           @db.Decimal(14, 2)
+  platformPayout    Decimal?          @db.Decimal(14, 2)
+  collectionCeiling Decimal?          @db.Decimal(14, 2)
+  amountCollected   Decimal           @default(0) @db.Decimal(14, 2)
+  amountGuaranteed  Decimal           @default(0) @db.Decimal(14, 2)
+  arrearsCarried    Decimal           @default(0) @db.Decimal(14, 2)
+  status            InstallmentStatus @default(SCHEDULED)
+  collectedAt       DateTime?
+  application       LoanApplication   @relation(fields: [applicationId], references: [id])
+  payouts           GuaranteePayout[]
+
+  @@unique([applicationId, installmentNo])
+  @@index([dueDate, status])
+  @@map("repayment_schedules")
+}
+
+model ParametricPolicy {
+  id                String          @id @default(uuid()) @db.Uuid
+  applicationId     String          @unique @db.Uuid
+  borrowerId        String          @db.Uuid
+  status            PolicyStatus    @default(PENDING)
+  regionCode        String
+  timezone          String          @default("Asia/Kuala_Lumpur")
+  windowStart       String          @default("08:00")
+  windowEnd         String          @default("19:00")
+  rainThresholdMmHr Decimal         @db.Decimal(6, 2)
+  floodAlertLevel   FloodAlertLevel @default(WARNING)
+  pingToleranceMin  Int             @default(20)
+  ipMaxRadiusM      Int             @default(3000)
+  waitingPeriodDays Int             @default(7)
+  coverageStart     DateTime        @db.Date
+  coverageEnd       DateTime        @db.Date
+  maxClaims         Int
+  claimsPaid        Int             @default(0)
+  guaranteeFee      Decimal         @db.Decimal(14, 2)
+  feeBreakdown      Json
+  beneficiary       String          @default("LENDER")
+  application       LoanApplication @relation(fields: [applicationId], references: [id])
+  borrower          Borrower        @relation(fields: [borrowerId], references: [id])
+  payouts           GuaranteePayout[]
+
+  @@map("parametric_policies")
+}
+
+model WeatherEvent {
+  id            String          @id @default(uuid()) @db.Uuid
+  source        String
+  regionCode    String
+  observedAt    DateTime
+  rainfallMmHr  Decimal         @db.Decimal(6, 2)
+  floodAlert    FloodAlertLevel @default(NONE)
+  polygon       Json
+  payouts       GuaranteePayout[]
+
+  @@unique([source, regionCode, observedAt])
+  @@index([regionCode, observedAt(sort: Desc)])
+  @@map("weather_events")
+}
+
+model LocationPing {
+  id               BigInt   @id @default(autoincrement())
+  borrowerId       String   @db.Uuid
+  ts               DateTime
+  lat              Float
+  lng              Float
+  source           String
+  accuracyM        Int
+  onlineOnPlatform Boolean  @default(true)
+  borrower         Borrower @relation(fields: [borrowerId], references: [id])
+
+  @@index([borrowerId, ts(sort: Desc)])
+  @@map("location_pings")
+}
+
+model GuaranteePayout {
+  id             String            @id @default(uuid()) @db.Uuid
+  policyId       String            @db.Uuid
+  weatherEventId String            @db.Uuid
+  scheduleId     String            @db.Uuid
+  outcome        TriggerOutcome
+  checkResults   Json
+  payee          String            @default("LENDER")
+  amount         Decimal           @db.Decimal(14, 2)
+  status         PayoutStatus      @default(PENDING)
+  idempotencyKey String            @unique
+  evaluatedAt    DateTime          @default(now())
+  settledAt      DateTime?
+  policy         ParametricPolicy  @relation(fields: [policyId], references: [id])
+  weatherEvent   WeatherEvent      @relation(fields: [weatherEventId], references: [id])
+  schedule       RepaymentSchedule @relation(fields: [scheduleId], references: [id])
+
+  @@map("guarantee_payouts")
+}
+
+// ------------------------------ PD pipeline / feature store (future) ------------
+model PdFeatureDefinition {
+  name        String @id
+  family      String
+  dtype       String
+  description String
+  version     Int    @default(1)
+
+  @@map("pd_feature_definitions")
+}
+
+model PdFeatureSnapshot {
+  applicationId  String          @db.Uuid
+  asOfDate       DateTime        @db.Date
+  weeksOnBook    Int
+  features       Json
+  featureVersion Int             @default(1)
+  application    LoanApplication @relation(fields: [applicationId], references: [id])
+
+  @@id([applicationId, asOfDate])
+  @@map("pd_feature_snapshots")
+}
+
+model PdLabel {
+  applicationId     String          @db.Uuid
+  horizonWeeks      Int
+  defaulted         Boolean
+  maxDpd            Int
+  guaranteeAssisted Boolean
+  maturedAt         DateTime        @db.Date
+  application       LoanApplication @relation(fields: [applicationId], references: [id])
+
+  @@id([applicationId, horizonWeeks])
+  @@map("pd_labels")
+}
+
+model PdModelVersion {
+  id             Int      @id @default(autoincrement())
+  name           String
+  trainedAt      DateTime
+  trainingWindow String
+  metrics        Json
+  status         String   @default("SHADOW")
+
+  @@map("pd_model_versions")
+}
